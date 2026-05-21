@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -15,6 +14,23 @@ import (
 
 	"github.com/mvanhorn/printing-press-library/library/travel/airbnb/internal/auth"
 )
+
+// buildCookieHeader serializes a slice of cookies into a Cookie header value.
+// Returns empty string when there are no cookies, so the caller can decide
+// not to set the header at all rather than send a blank one.
+func buildCookieHeader(cookies []*http.Cookie) string {
+	if len(cookies) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, "; ")
+}
 
 const (
 	wishlistIndexHash = "b8b421d802c399b55fb6ac1111014807a454184ad38f198365beb7836c018c18"
@@ -139,17 +155,14 @@ func BookingPrice(ctx context.Context, listingID, checkin, checkout string, gues
 	return priceBreakdownFromAny(root), nil
 }
 
+// PATCH: graphQLGet sets Cookie header directly per-request instead of
+// swapping c.http.Jar, eliminating the data race on the shared client
+// field when multiple goroutines call graphQLGet concurrently.
 func (c *Client) graphQLGet(ctx context.Context, path string, params url.Values, out *any) error {
 	cookies, err := auth.LoadCookies()
 	if err != nil {
 		return err
 	}
-	jar, _ := cookiejar.New(nil)
-	base, _ := url.Parse(airbnbBase)
-	jar.SetCookies(base, cookies)
-	old := c.http.Jar
-	c.http.Jar = jar
-	defer func() { c.http.Jar = old }()
 	u, _ := url.Parse(airbnbBase + path)
 	q := u.Query()
 	for k, vals := range params {
@@ -170,6 +183,9 @@ func (c *Client) graphQLGet(ctx context.Context, path string, params url.Values,
 		"X-Airbnb-GraphQL-Platform":        "web",
 		"X-Airbnb-GraphQL-Platform-Client": "minimalist-niobe",
 		"X-Airbnb-Supports-Airlock-V2":     "true",
+	}
+	if cookieHeader := buildCookieHeader(cookies); cookieHeader != "" {
+		headers["Cookie"] = cookieHeader
 	}
 	data, err := c.do(ctx, "GET", u.String(), airbnbUA, nil, headers)
 	if err != nil {
